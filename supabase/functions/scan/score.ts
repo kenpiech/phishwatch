@@ -47,6 +47,7 @@ export const NOISE_SUFFIXES = [
   "cloudfront.net",
   "plex.direct",
   "dyndns.loxonecloud.com",
+  "apple-virginia.herokuapp.com", // Heroku machine hostnames (direwolf-…), seen live on day 1
   "in-addr.arpa",
 ];
 

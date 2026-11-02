@@ -24,6 +24,7 @@ Deno.test("cleanDomain: drops AWS and other infrastructure noise", () => {
   assertEquals(cleanDomain("ip-10-0-0-1.ec2.amazonaws.com"), null);
   assertEquals(cleanDomain("x.compute.amazonaws.com.cn"), null);
   assertEquals(cleanDomain("1-2-3-4.abc123.plex.direct"), null);
+  assertEquals(cleanDomain("direwolf-0da4a9ce9d-5125cd78a2ba.apple-virginia.herokuapp.com"), null);
 });
 
 // ---------------------------------------------------------------- the official brand
