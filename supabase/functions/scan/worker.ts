@@ -158,6 +158,7 @@ export async function runScan(deps: Deps): Promise<RunResult> {
     log({ phase: "tiles", tiles: tileNumbers, bytes: tiles.reduce((s, t) => s + t.length, 0), fetch_ms: run.fetch_ms });
 
     // 3. parse: every entry -> its domains (first sighting wins)
+    const watches = await deps.db.watches(); // before the timer: parse_ms measures CPU work only
     const t1 = now();
     const seen = new Map<string, Seen>();
     let scanned = 0;
@@ -186,7 +187,6 @@ export async function runScan(deps: Deps): Promise<RunResult> {
     if (unreadable) run.note = `${unreadable} unreadable certificate${unreadable === 1 ? "" : "s"}`;
 
     // 4. score every domain against every watch
-    const watches = await deps.db.watches();
     const byWatch = new Map<string, HitRow[]>();
     for (const [domain, s] of seen) {
       const info = analyzeDomain(domain);
