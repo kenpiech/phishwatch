@@ -51,6 +51,29 @@ Deno.test("glued letters that aren't a known add-on don't count (seen live: bsic
   assertEquals(score("paypal24.com", { id: "p", official_domains: ["paypal.com"], terms: ["paypal"] })?.reasons, ["glued:paypal24"]);
 });
 
+Deno.test("other companies' clouds are not iCloud (seen live: SAP, Hetzner, Huawei)", () => {
+  const apple = { id: "a", official_domains: ["apple.com", "icloud.com"], terms: ["apple", "icloud"] };
+  for (const d of [
+    "di-broker.ingress.reg.42e1lvlk.ccloud.di-ci.hanacloud.ondemand.com",
+    "adp-online.hcloud.bmogc.net",
+    "dnkeeper.hicloud.com.elisabeth.josef-senden.de",
+    "yicloud.eshangtech.com",
+    "tcloud-house.crowntw.com",
+  ]) assertEquals(score(d, apple), null, d);
+});
+
+Deno.test("real typosquats seen live are still caught", () => {
+  const apple = { id: "a", official_domains: ["apple.com", "icloud.com"], terms: ["apple", "icloud"] };
+  assertEquals(score("www-lcloud-gpsmx.life", apple)?.reasons, ["term:icloud", "lookalike:lcloud"]);
+  assertEquals(score("device-iclouds.click", apple)?.reasons, ["term:icloud", "lookalike:iclouds", "tld:click"]);
+  const coinbase = { id: "c", official_domains: ["coinbase.com"], terms: ["coinbase"] };
+  assertEquals(score("coilbase.shop", coinbase)?.severity, "likely");
+  const amazon = { id: "z", official_domains: ["amazon.com"], terms: ["amazon"] };
+  assertEquals(score("amazone.com.ar", amazon)?.reasons, ["term:amazon", "lookalike:amazone"]);
+  const ms = { id: "m", official_domains: ["microsoft.com"], terms: ["microsoft"] };
+  assertEquals(score("rnicrosoftonline.cfd", ms)?.severity, "likely");
+});
+
 Deno.test("short terms never match by edit distance", () => {
   // "cloud" is one edit from "icloud", but only words of 6+ letters get edit-distance matching
   assertEquals(score("cloud.example.com", { id: "a", official_domains: ["icloud.com"], terms: ["icloud"] }), null);
@@ -122,7 +145,8 @@ Deno.test("hyphenated terms match across tokens", () => {
 
 Deno.test("skeleton folds lookalikes to the same form", () => {
   assertEquals(skeleton("acrnecu"), "acmecu");
-  assertEquals(skeleton("paypa1"), "paypal");
+  assertEquals(skeleton("paypa1"), skeleton("paypal")); // 1 and l fold together
+  assertEquals(skeleton("lcloud"), skeleton("icloud"));
   assertEquals(skeleton("аcmеcu"), "acmecu"); // Cyrillic а and е
   assertEquals(skeleton("ácmécu"), "acmecu"); // accents
 });

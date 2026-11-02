@@ -263,6 +263,14 @@ Deno.test("a malformed tile fails the run loudly and saves no hits", async () =>
   assertEquals(db.state.next_tile, null);
 });
 
+Deno.test("a timeout names the slow request", async () => {
+  const db = new FakeDb([ACME]);
+  const slow = { fetch: (() => Promise.reject(new DOMException("Signal timed out.", "TimeoutError"))) as typeof fetch, requests: [] };
+  await runScan(deps(db, slow));
+  assertEquals(db.runs[0].error, `GET ${LOG}checkpoint timed out after 5000 ms`);
+  assertEquals(db.state.backoff, false); // one slow response isn't a reason to pause
+});
+
 Deno.test("a checkpoint without a number on line 2 is rejected", async () => {
   const db = new FakeDb([ACME]);
   await runScan(deps(db, fakeLog("<html>oops</html>", {})));

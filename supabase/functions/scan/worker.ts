@@ -87,10 +87,17 @@ class HttpError extends Error {
 }
 
 async function get(deps: Deps, url: string, timeoutMs: number): Promise<Response> {
-  const res = await deps.fetch(url, {
-    headers: { "user-agent": USER_AGENT },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+  let res: Response;
+  try {
+    res = await deps.fetch(url, {
+      headers: { "user-agent": USER_AGENT },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    // Name the request: "Signal timed out." alone doesn't say whether the checkpoint or a tile was slow.
+    if (err instanceof Error && err.name === "TimeoutError") throw new Error(`GET ${url} timed out after ${timeoutMs} ms`);
+    throw err;
+  }
   if (!res.ok) {
     await res.body?.cancel();
     throw new HttpError(url, res.status);

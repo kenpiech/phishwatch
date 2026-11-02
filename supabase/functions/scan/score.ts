@@ -197,25 +197,32 @@ function findTerm(tokens: Token[], term: string): Match | null {
       consider({ term, token: text, label, kind: "token", lookalike: false });
       continue;
     }
-    // 2. lookalike token: same skeleton, or one edit away for longer words
+    // 2. lookalike token: same skeleton, or one edit away for longer words. The edit must not
+    //    touch the first letter: "ccloud", "hcloud", "yicloud" are other companies' clouds, not
+    //    iCloud, while real typosquats keep the start ("coilbase", "amazone", "paypla").
     const skel = skeleton(text);
-    if (skel === termSkel || (Math.min(text.length, term.length) >= 6 && editDistance(text, term) === 1)) {
+    const oneEdit = Math.min(text.length, term.length) >= 6 && text[0] === term[0] && editDistance(text, term) === 1;
+    if (skel === termSkel || oneEdit) {
       consider({ term, token: text, label, kind: "token", lookalike: true });
       continue;
     }
-    // 3. glued: the term plus a short prefix/suffix, a bait word or digits ("acmeculogin")
+    // 3. glued: the term plus a short prefix/suffix, a bait word or digits ("acmeculogin"),
+    //    checked as written, then in folded form ("rnicrosoftonline" -> "microsoft" + "oniine")
     if (parts === 1 && term.length >= 5) {
-      const rest = gluedRest(text, term) ?? gluedRest(skel, termSkel);
+      const exactRest = gluedRest(text, term, false);
+      const rest = exactRest ?? gluedRest(skel, termSkel, true);
       if (rest !== null) {
-        const lookalike = gluedRest(text, term) === null;
-        consider({ term, token: text, label, kind: "glued", lookalike, gluedRest: rest });
+        consider({ term, token: text, label, kind: "glued", lookalike: exactRest === null, gluedRest: rest });
       }
     }
   }
   return best;
 }
 
-function gluedRest(token: string, term: string): string | null {
+// What's glued to the term, if it's a bait word, digits or a common add-on; else null.
+// With folded = true, token and term are skeletons and the rest is matched in folded form,
+// but returned as the plain word ("oniine" -> "online") so bait words still count.
+function gluedRest(token: string, term: string, folded: boolean): string | null {
   if (token.length <= term.length) return null;
   const rest = token.startsWith(term)
     ? token.slice(term.length)
@@ -225,14 +232,21 @@ function gluedRest(token: string, term: string): string | null {
   if (rest === null) return null;
   // "pineapple" isn't Apple, "chasemarshal" isn't Chase, "bsicloud" isn't iCloud:
   // only a bait word, digits or a common add-on counts ("acmeculogin", "paypal24", "myacmecu").
-  const affixes = token.startsWith(term) ? GLUE_SUFFIXES : GLUE_PREFIXES;
-  return BAIT_WORDS.has(rest) || /^\d+$/.test(rest) || affixes.has(rest) ? rest : null;
+  if (/^\d+$/.test(rest)) return rest;
+  const words = token.startsWith(term) ? GLUE_SUFFIX_WORDS : GLUE_PREFIX_WORDS;
+  return (folded ? words.folded.get(rest) : words.plain.has(rest) ? rest : undefined) ?? null;
 }
 
-const GLUE_PREFIXES = new Set(["my", "get", "go", "the", "e", "i", "www", "app", "web", "mobile", "online"]);
-const GLUE_SUFFIXES = new Set(["app", "id", "hq", "us", "uk", "eu", "online", "web", "mobile", "help", "team"]);
+// Allowed glue words: bait words plus common add-ons, each indexed as written and folded.
+function glueWords(addOns: string[]) {
+  const plain = new Set([...BAIT_WORDS, ...addOns]);
+  return { plain, folded: new Map([...plain].map((w) => [skeleton(w), w])) };
+}
+const GLUE_PREFIX_WORDS = glueWords(["my", "get", "go", "the", "e", "i", "www", "app", "web", "mobile", "online"]);
+const GLUE_SUFFIX_WORDS = glueWords(["app", "id", "hq", "us", "uk", "eu", "online", "web", "mobile", "help", "team"]);
 
 // Fold lookalike characters to a common form: "асmеcu" (Cyrillic), "acrnecu", "acm3cu" -> "acmecu".
+// (Applied to both the token and the term, so only equality of skeletons matters.)
 export function skeleton(s: string): string {
   let out = "";
   for (const ch of s.normalize("NFKD")) {
@@ -243,7 +257,7 @@ export function skeleton(s: string): string {
     .replace(/rn/g, "m")
     .replace(/vv/g, "w")
     .replace(/0/g, "o")
-    .replace(/1/g, "l")
+    .replace(/[l1|]/g, "i") // i, l, 1 and | look alike: "lcloud" and "1cloud" both fold to "icloud"
     .replace(/3/g, "e")
     .replace(/5/g, "s");
 }
