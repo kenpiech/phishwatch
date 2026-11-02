@@ -139,3 +139,63 @@ Only **`runs`** shows whether the system is working, and every failure ends in o
 - **stale:** no run arrived. Covers cron, auth, publication or socket failures.
 
 The page judges freshness by the age of the last `runs` row, never by whether hits are arriving, because zero hits is a normal result.
+
+## Step 4: Build the worker
+
+**Ask:** "Show me the worker's logs from its last three runs, and explain each line."
+
+These are the Supabase function logs (`function_logs`) and gateway logs (`function_edge_logs`) for three consecutive cron runs on 2026-11-02, oldest first. Each run writes four JSON lines, one per phase, which is enough to explain a run without exceeding Edge logging limits.
+
+### Run A: 17:15:44 UTC
+
+```
+17:15:44.966  {"phase":"checkpoint","tree_size":575664793,"newest_tile":2248689,"next_tile":2248683,"skipped":6}
+17:15:46.070  {"phase":"tiles","tiles":[2248689],"bytes":384579,"fetch_ms":1237}
+17:15:46.133  {"phase":"score","scanned":256,"domains":326,"watches":5,"hits":0,"unreadable":0,"parse_ms":28}
+17:15:46.156  {"phase":"write","inserted":0,"updated":0,"next_tile":2248690,"duration_ms":1339}
+17:15:46.157  POST | 200 | …/functions/v1/scan   (1,539 ms)
+```
+
+| Line | Meaning |
+|---|---|
+| `checkpoint` | The log holds **575,664,793** entries, so the newest *full* tile is ⌊575,664,793 / 256⌋ − 1 = **2248689**. The cursor (`next_tile`) says the last run ended before **2248683**, so tiles 2248683–2248688 (**6**) were issued since then and won't be read: we sample the newest one. |
+| `tiles` | Downloaded tile **2248689**: **384,579 bytes** (256 entries). Fetching the checkpoint plus the tile from Google took **1,237 ms**, most of the run. |
+| `score` | All **256** entries parsed, none unreadable. They named **326** unique domains after cleanup. Each was scored against the **5** watches (the hidden demo brands): **0** hits. That took **28 ms** of CPU, about 1.4% of the 2-second limit. |
+| `write` | `finish_scan` upserted nothing (**0 inserted, 0 updated**), wrote the `runs` row and moved the cursor to **2248690**. The run took **1,339 ms** from claim to write. |
+| `POST \| 200` | The gateway's view: cron's request was accepted (secret key OK) and answered **200** in **1,539 ms**. That's ~200 ms more than `duration_ms`, which covers the key check and the response. |
+
+### Run B: 17:15:54 UTC
+
+```
+17:15:54.975  {"phase":"checkpoint","tree_size":575666455,"newest_tile":2248696,"next_tile":2248690,"skipped":6}
+17:15:55.669  {"phase":"tiles","tiles":[2248696],"bytes":370589,"fetch_ms":833}
+17:15:55.718  {"phase":"score","scanned":256,"domains":302,"watches":5,"hits":0,"unreadable":0,"parse_ms":26}
+17:15:55.756  {"phase":"write","inserted":0,"updated":0,"next_tile":2248697,"duration_ms":934}
+17:15:55.758  POST | 200 | …/functions/v1/scan   (1,125 ms)
+17:15:59.803  shutdown
+```
+
+- **`checkpoint`:** `next_tile` **2248690** is exactly what Run A wrote: the cursor carries from run to run. The log grew by **1,662** entries in ~10 s (≈166/s, quieter than the 233/s measured in Step 1), so 6 tiles were skipped again.
+- **`tiles`, `score`, `write`:** same story. A different tile (2248696), a slightly smaller tile (370,589 bytes, since entries vary in length), 302 domains, 0 hits, cursor → 2248697.
+- **`shutdown`:** the Edge runtime stopped this function's worker (an isolate) ~4 s after it answered. Supabase keeps a worker warm between nearby calls, then recycles it. This is normal, not an error.
+
+### Run C: 17:16:05 UTC
+
+```
+17:16:05.086  booted (time: 60ms)
+17:16:05.956  {"phase":"checkpoint","tree_size":575668191,"newest_tile":2248702,"next_tile":2248697,"skipped":5}
+17:16:06.015  {"phase":"tiles","tiles":[2248702],"bytes":381166,"fetch_ms":761}
+17:16:06.094  {"phase":"score","scanned":256,"domains":338,"watches":5,"hits":0,"unreadable":0,"parse_ms":46}
+17:16:06.137  {"phase":"write","inserted":0,"updated":0,"next_tile":2248703,"duration_ms":952}
+17:16:06.139  POST | 200 | …/functions/v1/scan   (1,237 ms)
+```
+
+- **`booted (time: 60ms)`:** because Run B's worker shut down, this run started a fresh one (a cold start), which took 60 ms. The gap between `booted` and `checkpoint` (~0.9 s) is loading the imports and the claim RPC.
+- **`checkpoint` … `write`:** cursor 2248697 → 2248703. **5** tiles skipped this time, because a little less was issued in this interval. 338 domains, 0 hits, 46 ms of CPU.
+
+### What the three runs show together
+- **Freshness:** a run every ~10 s (44.97 → 54.98 → 05.96), each one `ok`. These are the `runs` rows the page will use for "fresh".
+- **The cursor chain** 2248683 → 2248690 → 2248697 → 2248703 never goes backwards and never re-reads a tile.
+- **Coverage:** we read 1 tile and skip 5–6, so ≈15% of the log in this quieter minute (≈11–12% at busier times).
+- **Where time goes:** downloading from Google (~0.8–1.2 s) dominates, while parsing and scoring stays at 26–46 ms. The CPU budget has room for `tiles_per_run = 3` if we ever want more coverage.
+- **0 hits is normal:** about 1 second of issuance per run, and the demo brands appear a few times a minute *across the whole log*. The first two scheduled minutes produced 2 low-severity hits (Heroku hostnames containing "apple").
