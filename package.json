@@ -17,11 +17,14 @@
     "react-dom": "19.3.0"
   },
   "devDependencies": {
+    "@clerk/testing": "^2.2.53",
+    "@playwright/test": "^1.64.1",
     "@tailwindcss/turbopack": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "deno": "^2.9.6",
+    "dotenv": "^18.0.9",
     "eslint": "^9",
     "eslint-config-next": "16.4.4",
     "supabase": "^3.0.0",
