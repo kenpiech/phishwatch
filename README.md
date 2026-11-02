@@ -1,36 +1,47 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# phishwatch
 
-## Getting Started
+You tell phishwatch your brand. Every 10 seconds it checks newly issued HTTPS certificates and shows you, live, any domain that looks like it's impersonating you.
 
-First, run the development server:
+**Live:** https://phishwatch-umber.vercel.app (work in progress)
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## Data flow
+
+```mermaid
+flowchart LR
+  subgraph Google["Google CT log (ParcelYard 2027h1)"]
+    CP["/checkpoint<br/>tree size, every ~1 s"]
+    TL["/tile/data/…<br/>256 certs per tile"]
+  end
+  subgraph Supabase
+    CRON["Supabase Cron<br/>pg_cron + pg_net<br/>every 10 s"]
+    FN["Edge Function: scan<br/>(Deno, secret key)"]
+    DB[("Postgres<br/>watches · hits · runs<br/>scan_state · presets")]
+    RT["Realtime<br/>(checks RLS per subscriber)"]
+  end
+  subgraph Vercel
+    PAGE["Next.js page<br/>Clerk session"]
+  end
+  CRON -- "HTTP POST" --> FN
+  FN -- "1 GET" --> CP
+  FN -- "GET newest full tile" --> TL
+  FN -- "insert only new hits (on conflict do nothing)<br/>+ 1 runs row, cursor" --> DB
+  DB -- "INSERT events (WAL)" --> RT
+  RT -- "WebSocket: only your hits,<br/>plus run status" --> PAGE
+  PAGE -- "Clerk JWT → RLS'd reads/writes<br/>(watches CRUD, initial load)" --> DB
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+1. **Supabase Cron** calls the `scan` Edge Function every 10 seconds.
+2. `scan` reads the log's **checkpoint** to learn its size, then downloads the **newest full tile**: 256 consecutive certificates, about 1 second of issuance. The log grows by about 233 certificates a second, so each run samples about 1 tile in 9 (≈11%).
+3. It pulls the domain names out of each certificate, scores them against every user's watched brands, and inserts only **new** hits. A unique `(watch_id, domain)` key plus `on conflict do nothing` makes reruns harmless. Every run writes one `runs` row, including failed runs.
+4. Postgres sends each insert to **Realtime**. Realtime applies row-level security per subscriber, so each person receives only their own hits, plus run status for the freshness indicator.
+5. The **page** signs in with Clerk. Supabase accepts the Clerk JWT, and RLS keys on its `sub` claim. The page loads its first data directly, then listens on the WebSocket, so it updates without a refresh.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### What breaks if a part changes
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| Change | Effect | How it shows |
+|---|---|---|
+| Google rolls the log to a new shard (2027h2) or renames it | Checkpoint returns 404, so runs fail with `ok = false` | Page shows **down**. Fix: update `scan_state.log_url`; no redeploy needed. |
+| The tile format changes | The parser throws, and the error is saved in `runs.error` | Page shows **down**, with the error |
+| The cron stops | No new `runs` rows | Page shows **stale** after 30 s |
+| The table is removed from the Realtime publication, or its policy or grant is dropped | The page silently receives nothing, with no error | The "last run" age keeps rising, so the page still shows **stale** |
+| The Clerk JWT or the Supabase third-party auth setting changes | RLS denies every read | Empty feed. The Playwright two-user test catches it. |

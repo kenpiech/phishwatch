@@ -86,3 +86,56 @@ Other MCP servers are connected to my session (artifacts, Claude Docs, Gmail/Cal
 ### What I can't check from here
 - **Clerk ↔ Supabase third-party auth.** It's a dashboard setting the MCP can't see. The Step 5 Playwright test proves it: user A's JWT must pass RLS and user B must see nothing of A's.
 - **Secrets.** By design I can't read `.env*` and don't hold the Supabase secret key. The Edge Function gets it from Supabase at runtime.
+
+## Step 3: Data-flow chart
+
+**Ask:** "Walk me through the chart: what each part sends to the next, and what would break if one part changed it."
+
+The chart is in `README.md`. It has seven arrows, taken in the order data moves.
+
+### 1. Cron → `scan`: "run now"
+- **Sends:** every 10 s, `pg_cron` runs a SQL job that uses `pg_net` to make an **HTTP POST** to the function's URL. The request carries an `Authorization` header with a key read from **Vault**. The body is empty. The trigger carries no data; it only says "go".
+- **If it changes:** if the function URL, its name or the Vault key is wrong, the POST gets a 404 or 401. The function never runs, so **no `runs` row** is written. Nothing logs an error in our tables, and the page shows **stale** after 30 s. The failed call shows up only in `net._http_response` and `cron.job_run_details`.
+
+### 2. `scan` → `/checkpoint`: "how big is the log?"
+- **Sends:** one `GET`. It **receives** about 600 bytes of signed text, and the worker keeps only **line 2, the tree size**. `floor(size / 256) − 1` gives the newest full tile.
+- **If it changes:** after a shard rollover or rename, the request returns 404. The worker writes `runs.ok = false` with the error, and the page shows **down**. If line 2 stops being a number, the worker rejects it the same way rather than guessing. A 429 or 5xx response makes the worker back off (`scan_state.backoff_until`).
+
+### 3. `scan` → `/tile/data/…`: "give me those 256 certificates"
+- **Sends:** one `GET` for the tile path (`x002/x244/880`). It **receives** about 350 KB of binary: 256 length-prefixed entries, each with a timestamp, entry type, certificate DER, leaf index and fields we skip.
+- **If it changes:** a new path scheme returns 404, which means **down**. A changed entry layout makes the parser throw, or end with a byte count that isn't exactly 256 entries. The worker refuses to save partial results, writes `ok = false` with the error, and the page shows **down**. If the certificate format changed, we'd just extract no domains: the run is ok, with 0 hits, which is the hardest failure to notice. `runs.scanned` (domain count) dropping to 0 is the warning sign.
+
+### 4. `scan` → Postgres: "here's what's new"
+- **Reads first:** `scan_state` (`enabled`, `log_url`, cursor, backoff) and all `watches`.
+- **Sends:**
+  - `insert into hits … on conflict (watch_id, domain) do nothing`: `watch_id, domain, registrable, score, severity, reasons[], issuer, entry_ts, log_index`
+  - one `runs` row: `ok, error, note, scanned, skipped, hits_inserted, tree_size, tile_from, tile_to` and timings
+  - an update to the `scan_state` cursor
+
+  It writes with the **secret key**, which bypasses RLS. That's why clients get no write access to these tables.
+- **If it changes:**
+  - If a column is renamed or a constraint added, the hits insert fails, and the error goes into `runs`, so the page shows **down**.
+  - If the **`runs` insert itself** breaks, the worker can't log anything, so the page shows **stale**.
+  - If the **unique key** is dropped, every rerun re-inserts the same hits, and users get duplicate alerts every 10 s. That's why "a second run inserts 0 rows" is a test.
+
+### 5. Postgres → Realtime: "a row was inserted"
+- **Sends:** each committed insert into a table in the **`supabase_realtime` publication** (`hits`, `runs`) goes out through Postgres's write-ahead log (WAL) as an INSERT event with the full new row.
+- **If it changes:** if a table is removed from the publication, Realtime never hears about inserts. There's **no error anywhere**; the page silently gets nothing. For `runs` this shows as **stale**. For `hits` it looks like "no matches", which is why the page's freshness comes from `runs`.
+
+### 6. Realtime → page: "this row is yours"
+- **Sends:** over one **WebSocket**, a `postgres_changes` message with the new row's JSON. Before sending, Realtime checks RLS **as that subscriber**: it needs `grant select` on the table **and** a select policy that passes. So user A gets only hits on A's watches, and everyone gets `runs`.
+- **If it changes:** if the grant or policy is dropped, the message is silently filtered out (the spec's warning). If the page subscribes to UPDATE or DELETE, it gets nothing useful, because Realtime can't apply RLS to deletes. That's why it subscribes to INSERT only. A dropped connection triggers a reconnect and a refetch, and the page shows a connection state.
+
+### 7. Page ↔ Postgres: "who I am, and what I want"
+- **Sends:** the browser gets a **Clerk session token** (a JWT with `sub = user_…` and `role = authenticated`) and sends it as a Bearer token to Supabase's REST API. Supabase verifies it through **third-party auth**, and RLS compares `auth.jwt()->>'sub'` to `watches.user_id`. The page uses it to load watches, the last hits and the latest run, and to create, update and delete watches. The same token authorizes the Realtime socket (arrow 6).
+- **If it changes:**
+  - If **third-party auth is disabled**, or the Clerk **`role` claim is removed**, the request is treated as anonymous, and RLS returns nothing: an empty page, no error.
+  - If the **`sub` format changes**, for example after moving to a new Clerk app, existing watches no longer match, and a user "loses" their brands.
+  - The Playwright test with two users catches both.
+
+### What ties it together
+Only **`runs`** shows whether the system is working, and every failure ends in one of two visible states:
+- **down:** a run completed but reported an error (`ok = false`)
+- **stale:** no run arrived. Covers cron, auth, publication or socket failures.
+
+The page judges freshness by the age of the last `runs` row, never by whether hits are arriving, because zero hits is a normal result.
