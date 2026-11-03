@@ -276,7 +276,7 @@ The two-user test passed on its first real run. A test that keeps the page open 
 > Today's total ("2.1 M certificates checked today") comes from `scan_stats()`.
 
 **4. Agentic workflow: what your agent's tests check, and what you found in the logs.**
-> - **Worker** (`deno test`, 51 tests):
+> - **Worker** (`deno test`, 55 tests):
 >   - the real saved tile parses to exactly 256 entries, with every byte consumed
 >   - its 172 certificates' SAN names match openssl's
 >   - certificates generated with openssl yield exactly 7 expected hits and scores
@@ -293,7 +293,7 @@ The two-user test passed on its first real run. A test that keeps the page open 
 >   - a live match without a reload
 >   - B can't plant a match on A's brand
 >   - a 3.5-minute session across token rotations
-  - recovery after the server closes a channel
+>   - recovery after the server closes a channel
 > - **Logs:**
 >   - four phases per run (checkpoint → tiles → score → write)
 >   - downloading dominates (≈1 s); scoring takes 20–50 ms
