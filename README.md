@@ -6,6 +6,10 @@ You tell phishwatch your brand. Every 10 seconds it checks newly issued HTTPS ce
 
 Phishing sites need HTTPS to look trustworthy, and every publicly trusted certificate must be published in **Certificate Transparency (CT)** logs before browsers accept it. So when someone sets up `acmecu-login[.]top`, its certificate appears in a public log within seconds, often before the first phishing email is sent. phishwatch reads one of those logs continuously and flags names that imitate the brands its users register.
 
+| Signed out | Signed in: the live feed |
+|---|---|
+| ![The landing page](docs/screenshots/0-signed-out.png) | ![Live status bar and likely-phishing matches for a Microsoft brand](docs/screenshots/1-fresh.png) |
+
 ## Using it
 
 1. **Sign in** with your email (a one-time code; no password, no card).
@@ -74,7 +78,7 @@ A domain becomes a match only if it contains one of the brand's terms, as a whol
 | risky TLD (.top, .xyz, .click, .shop, …) | +2 | `…[.]top` |
 | 3+ hyphens | +1 | `acmecu-secure-login-verify[.]top` |
 
-**≥ 7 likely phishing, 4–6 suspicious, 2–3 low.** The brand's official domains and their subdomains are never flagged. A word that merely contains the term doesn't count (`prometall` isn't Meta; `pineapple` isn't Apple), and infrastructure that floods the log (AWS, CloudFront, Plex, some Heroku hostnames) is dropped before scoring. Two rules came from the first day of live data: glued words must be telling (so `bsicloud` isn't iCloud), and a one-letter typo must keep the first letter (so SAP's `ccloud` and Hetzner's `hcloud` aren't iCloud).
+**≥ 7 likely phishing, 4–6 suspicious, 2–3 low.** The brand's official domains and their subdomains are never flagged. A word that merely contains the term doesn't count (`prometall` isn't Meta; `pineapple` isn't Apple), and infrastructure that floods the log (AWS, CloudFront, Plex, some Heroku hostnames) is dropped before scoring. Two rules came from the first day of live data: glued words must be telling (so `bsicloud` isn't iCloud), and a one-letter typo must keep the first letter (so SAP's `ccloud` and Hetzner's `hcloud` aren't iCloud). A known limitation: a brand term used as a whole subdomain of an unrelated site scores high. `outlook.<casino-name>[.]top` comes up often and is more likely a mail-setup hostname on a spam site than Microsoft impersonation.
 
 ## What it can and can't see
 
