@@ -51,11 +51,19 @@ export const NOISE_SUFFIXES = [
   "in-addr.arpa",
 ];
 
-// Characters that look like Latin letters (Cyrillic and Greek), mapped to the letter.
+// Characters that look like Latin letters, mapped to the letter. Accented letters ("á") are
+// handled by NFKD below; these are the ones Unicode doesn't decompose.
 const CONFUSABLES: Record<string, string> = {
+  // Cyrillic
   "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "і": "i", "ј": "j",
-  "ѕ": "s", "ԁ": "d", "һ": "h", "ӏ": "l", "ԝ": "w", "ԛ": "q", "ɡ": "g", "ı": "i",
+  "ѕ": "s", "ԁ": "d", "һ": "h", "ӏ": "l", "ԝ": "w", "ԛ": "q", "к": "k", "ԍ": "g", "ь": "b", "ү": "y",
+  // Greek
   "ο": "o", "α": "a", "ν": "v", "ρ": "p", "ι": "i", "κ": "k", "τ": "t", "υ": "u", "ε": "e",
+  "ϲ": "c", "ς": "c", "ϳ": "j", "η": "n", "ω": "w", "χ": "x",
+  // Armenian
+  "օ": "o", "ս": "u", "ո": "n", "հ": "h", "ց": "g", "զ": "q",
+  // Latin letters with strokes or variant shapes
+  "ɡ": "g", "ı": "i", "ɑ": "a", "ɩ": "i", "ł": "l", "ø": "o", "đ": "d", "ħ": "h", "ŧ": "t", "ƅ": "b",
 };
 
 // ------------------------------------------------------------------ domain cleanup
@@ -197,20 +205,24 @@ function findTerm(tokens: Token[], term: string): Match | null {
       consider({ term, token: text, label, kind: "token", lookalike: false });
       continue;
     }
-    // 2. lookalike token: same skeleton, or one edit away for longer words. The edit must not
-    //    touch the first letter: "ccloud", "hcloud", "yicloud" are other companies' clouds, not
-    //    iCloud, while real typosquats keep the start ("coilbase", "amazone", "paypla").
+    // 2. lookalike token: same skeleton; same skeleton once repeated letters are squeezed
+    //    ("appple", "aple", "paypaal"; terms of 5+ letters, so "metta" isn't Meta); or one edit
+    //    away for longer words. The edit must not touch the first letter: "ccloud", "hcloud",
+    //    "yicloud" are other companies' clouds, not iCloud, while real typosquats keep the
+    //    start ("coilbase", "amazone", "paypla"). No `continue`: an exact glued match
+    //    ("nokia4" = "nokia" + digits) outranks a lookalike reading of the same token.
     const skel = skeleton(text);
+    const repeats = term.length >= 5 && squeeze(skel) === squeeze(termSkel);
     const oneEdit = Math.min(text.length, term.length) >= 6 && text[0] === term[0] && editDistance(text, term) === 1;
-    if (skel === termSkel || oneEdit) {
+    if (skel === termSkel || repeats || oneEdit) {
       consider({ term, token: text, label, kind: "token", lookalike: true });
-      continue;
     }
     // 3. glued: the term plus a short prefix/suffix, a bait word or digits ("acmeculogin"),
-    //    checked as written, then in folded form ("rnicrosoftonline" -> "microsoft" + "oniine")
+    //    checked as written, then folded ("rnicrosoftonline" -> "microsoft" + "oniine"),
+    //    then folded and squeezed ("paypaallogin" -> "paypai" + "iogin")
     if (parts === 1 && term.length >= 5) {
-      const exactRest = gluedRest(text, term, false);
-      const rest = exactRest ?? gluedRest(skel, termSkel, true);
+      const exactRest = gluedRest(text, term, "plain");
+      const rest = exactRest ?? gluedRest(skel, termSkel, "folded") ?? gluedRest(squeeze(skel), squeeze(termSkel), "squeezed");
       if (rest !== null) {
         consider({ term, token: text, label, kind: "glued", lookalike: exactRest === null, gluedRest: rest });
       }
@@ -220,9 +232,11 @@ function findTerm(tokens: Token[], term: string): Match | null {
 }
 
 // What's glued to the term, if it's a bait word, digits or a common add-on; else null.
-// With folded = true, token and term are skeletons and the rest is matched in folded form,
-// but returned as the plain word ("oniine" -> "online") so bait words still count.
-function gluedRest(token: string, term: string, folded: boolean): string | null {
+// In "folded" and "squeezed" form, token and term are already in that form, and the rest is
+// looked up in that form but returned as the plain word ("oniine" -> "online") so bait words
+// still count.
+type Form = "plain" | "folded" | "squeezed";
+function gluedRest(token: string, term: string, form: Form): string | null {
   if (token.length <= term.length) return null;
   const rest = token.startsWith(term)
     ? token.slice(term.length)
@@ -233,20 +247,31 @@ function gluedRest(token: string, term: string, folded: boolean): string | null 
   // "pineapple" isn't Apple, "chasemarshal" isn't Chase, "bsicloud" isn't iCloud:
   // only a bait word, digits or a common add-on counts ("acmeculogin", "paypal24", "myacmecu").
   if (/^\d+$/.test(rest)) return rest;
-  const words = token.startsWith(term) ? GLUE_SUFFIX_WORDS : GLUE_PREFIX_WORDS;
-  return (folded ? words.folded.get(rest) : words.plain.has(rest) ? rest : undefined) ?? null;
+  const suffix = token.startsWith(term);
+  const words = suffix ? GLUE_SUFFIX_WORDS : GLUE_PREFIX_WORDS;
+  if (form === "plain") return words.plain.has(rest) ? rest : null;
+  if (form === "folded") return words.folded.get(rest) ?? null;
+  // Squeezing can swallow a letter at the seam: "paypal" + "login" squeezes to "paypai" + "ogin".
+  // So also try the rest with the term's edge letter put back.
+  const seam = suffix ? term[term.length - 1] + rest : rest + term[0];
+  return words.squeezed.get(rest) ?? words.squeezed.get(seam) ?? null;
 }
 
 // Allowed glue words: bait words plus common add-ons, each indexed as written and folded.
 function glueWords(addOns: string[]) {
   const plain = new Set([...BAIT_WORDS, ...addOns]);
-  return { plain, folded: new Map([...plain].map((w) => [skeleton(w), w])) };
+  return {
+    plain,
+    folded: new Map([...plain].map((w) => [skeleton(w), w])),
+    squeezed: new Map([...plain].map((w) => [squeeze(skeleton(w)), w])),
+  };
 }
 const GLUE_PREFIX_WORDS = glueWords(["my", "get", "go", "the", "e", "i", "www", "app", "web", "mobile", "online"]);
 const GLUE_SUFFIX_WORDS = glueWords(["app", "id", "hq", "us", "uk", "eu", "online", "web", "mobile", "help", "team"]);
 
 // Fold lookalike characters to a common form: "асmеcu" (Cyrillic), "acrnecu", "acm3cu" -> "acmecu".
 // (Applied to both the token and the term, so only equality of skeletons matters.)
+// NFKD also turns full-width (ａ) and math-styled (𝐚) letters into plain ones.
 export function skeleton(s: string): string {
   let out = "";
   for (const ch of s.normalize("NFKD")) {
@@ -260,6 +285,11 @@ export function skeleton(s: string): string {
     .replace(/[l1|]/g, "i") // i, l, 1 and | look alike: "lcloud" and "1cloud" both fold to "icloud"
     .replace(/3/g, "e")
     .replace(/5/g, "s");
+}
+
+// Collapse runs of the same letter: "appple" and "aple" both squeeze to "apie" (after folding).
+export function squeeze(s: string): string {
+  return s.replace(/(.)\1+/g, "$1");
 }
 
 // Optimal string alignment distance (Levenshtein plus adjacent swaps).

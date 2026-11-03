@@ -1,5 +1,6 @@
 import { assertEquals } from "@std/assert";
-import { analyzeDomain, cleanDomain, editDistance, scoreDomain, skeleton, type Watch } from "./score.ts";
+import { domainToASCII } from "node:url";
+import { analyzeDomain, cleanDomain, editDistance, scoreDomain, skeleton, squeeze, type Watch } from "./score.ts";
 import { parseTile } from "./tile.ts";
 import { parseCert } from "./x509.ts";
 import { ACME, META, syntheticTile } from "./testing.ts";
@@ -79,6 +80,37 @@ Deno.test("short terms never match by edit distance", () => {
   assertEquals(score("cloud.example.com", { id: "a", official_domains: ["icloud.com"], terms: ["icloud"] }), null);
 });
 
+Deno.test("repeated or dropped letters are lookalikes (terms of 5+ letters)", () => {
+  const apple = { id: "a", official_domains: ["apple.com"], terms: ["apple"] };
+  const paypal = { id: "p", official_domains: ["paypal.com"], terms: ["paypal"] };
+  const netflix = { id: "n", official_domains: ["netflix.com"], terms: ["netflix"] };
+  assertEquals(score("appple-id.top", apple)?.reasons, ["term:apple", "lookalike:appple", "tld:top"]);
+  assertEquals(score("aple.support", apple)?.reasons, ["term:apple", "lookalike:aple"]);
+  assertEquals(score("paaypall.com", paypal)?.reasons, ["term:paypal", "lookalike:paaypall"]); // two edits
+  assertEquals(score("nettfllix.xyz", netflix)?.severity, "likely"); // 2 + lookalike 3 + .xyz 2
+  // glued, squeezed, and the seam letter put back: "paypaal" + "login"
+  assertEquals(score("paypaallogin.top", paypal)?.reasons, ["glued:paypaallogin", "lookalike:paypaallogin", "bait:login", "tld:top"]);
+  // short terms don't get this: "metta" is a word, not Meta
+  assertEquals(score("metta-meditation.org", META), null);
+});
+
+Deno.test("homoglyph domains arrive as punycode and are decoded, in each script", () => {
+  const paypal = { id: "p", official_domains: ["paypal.com"], terms: ["paypal"] };
+  const apple = { id: "a", official_domains: ["apple.com"], terms: ["apple"] };
+  const amazon = { id: "z", official_domains: ["amazon.com"], terms: ["amazon"] };
+  const cases: [string, Watch, string][] = [
+    [domainToASCII("pаypаl-login.top"), paypal, "pаypаl"], // Cyrillic а
+    [domainToASCII("аpple.com"), apple, "аpple"], // Cyrillic а, first letter
+    [domainToASCII("amazօn.shop"), amazon, "amazօn"], // Armenian օ
+    [domainToASCII("amazοn.shop"), amazon, "amazοn"], // Greek ο
+    [domainToASCII("amazøn.com"), amazon, "amazøn"], // Latin ø
+  ];
+  for (const [ascii, watch, token] of cases) {
+    assertEquals(ascii.startsWith("xn--"), true, ascii);
+    assertEquals(score(ascii, watch)?.reasons.includes(`lookalike:${token}`), true, ascii);
+  }
+});
+
 Deno.test("the public suffix is not matched (a brand-named hosting platform isn't a hit)", () => {
   // "github.io" is a public suffix; "acmecu" must appear left of it to count
   assertEquals(score("someone.github.io", { id: "g", official_domains: ["github.com"], terms: ["github"] }), null);
@@ -149,6 +181,22 @@ Deno.test("skeleton folds lookalikes to the same form", () => {
   assertEquals(skeleton("lcloud"), skeleton("icloud"));
   assertEquals(skeleton("аcmеcu"), "acmecu"); // Cyrillic а and е
   assertEquals(skeleton("ácmécu"), "acmecu"); // accents
+});
+
+Deno.test("skeleton folds non-Latin lookalikes: Cyrillic, Greek, Armenian, stroked Latin", () => {
+  assertEquals(skeleton("pаypаl"), skeleton("paypal")); // Cyrillic а
+  assertEquals(skeleton("gοοgle"), skeleton("google")); // Greek ο
+  assertEquals(skeleton("gօօgle"), skeleton("google")); // Armenian օ
+  assertEquals(skeleton("netfӏix"), skeleton("netflix")); // Cyrillic palochka ӏ
+  assertEquals(skeleton("ϲoinbase"), skeleton("coinbase")); // Greek lunate sigma (NFKD makes it ς)
+  assertEquals(skeleton("amazøn"), skeleton("amazon")); // ø has no Unicode decomposition
+  assertEquals(skeleton("ｐａｙｐａｌ"), "paypai"); // full-width letters, via NFKD
+});
+
+Deno.test("squeeze collapses repeated letters", () => {
+  assertEquals(squeeze("appple"), "aple");
+  assertEquals(squeeze(skeleton("applle")), squeeze(skeleton("apple")));
+  assertEquals(squeeze("paypal"), "paypal");
 });
 
 Deno.test("editDistance counts one swap as one edit", () => {

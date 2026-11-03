@@ -72,7 +72,7 @@ A domain becomes a match only if it contains one of the brand's terms, as a whol
 | Signal | Points | Example |
 |---|---|---|
 | term match: exact word, lookalike, or glued to a bait word / digits / common add-on | +2 | `acmecu-…`, `myacmecu`, `acmeculogin` |
-| lookalike rather than exact (Cyrillic letters, `rn`→`m`, `1`/`l`→`i`, one typo keeping the first letter) | +3 | `acrnecu`, `аcmecu` (punycode), `coilbase` |
+| lookalike rather than exact: non-Latin letters that look Latin (Cyrillic `а`, Greek `ο`, Armenian `օ`, `ø`, `ł`, full-width…), `rn`→`m`, `1`/`l`→`i`, repeated or dropped letters (5+ letter terms), one typo keeping the first letter | +3 | `acrnecu`, `аcmecu` (punycode), `appple`, `coilbase` |
 | brand used as a subdomain of someone else's domain | +3 | `acmecu.org.verify-acct[.]top` |
 | bait words (login, verify, secure, account, billing, …) | +2 each, max +4 | `acmecu-login…` |
 | risky TLD (.top, .xyz, .click, .shop, …) | +2 | `…[.]top` |
