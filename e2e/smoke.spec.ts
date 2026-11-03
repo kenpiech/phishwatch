@@ -27,6 +27,12 @@ test("signed in: add a brand, see the scanner live, remove the brand", async ({ 
     await expect(leftovers).toHaveCount(n - 1);
   }
 
+  // a brand-new user (zero brands) still gets live runs over the WebSocket, not just the
+  // initial load: wait out at least one scanner run and check the age resets and nothing is stuck
+  await page.waitForTimeout(12_000);
+  await expect(page.getByTestId("status-fresh")).toContainText(/· [0-9] s ago/, { timeout: 15_000 });
+  await expect(page.getByText("Reconnecting…")).toHaveCount(0);
+
   const name = `Smoke ${Date.now()}`;
   const chip = page.getByRole("button", { name: `Stop watching ${name}` });
   if (!(await page.getByLabel("Brand name").isVisible())) await page.getByRole("button", { name: /add a brand/i }).click();

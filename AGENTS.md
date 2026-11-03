@@ -27,7 +27,13 @@ It is a standalone app. It shares no code, database, Clerk app or Vercel project
 - No payment method is added to any service (Supabase Free, Vercel Hobby, Clerk Free). If a service asks for one, stop and ask.
 - Domains from the log may be live phishing sites. Show them defanged (`example[.]top`) and never render them as links.
 - `supabase/` is excluded in `tsconfig.json`, because Edge Functions are Deno, not Node.
-- Tests for the worker: `npx deno test` inside `supabase/functions/scan/`.
+- Tests:
+  - worker: `npx deno test --allow-read` inside `supabase/functions/scan/`
+  - page helpers: `npm test`
+  - browser: `npx playwright test` (Clerk dev test users; `PW_BASE_URL=<url>` targets a deployed site)
+- Deploying the worker through the MCP replaces the whole function: send all six files (`index.ts`, `worker.ts`, `tile.ts`, `x509.ts`, `score.ts`, `deno.json`) with `import_map_path: "deno.json"` and `verify_jwt: false`.
+- Realtime in the page: every channel gets a unique name (`runs-<uuid>`), and its owner removes it. Never call `removeAllChannels()` on cleanup. The page re-offers Clerk's token every 10 s and rebuilds channels the server closes (see `learning.md`, Step 5).
+- Left in place on purpose: 5 hidden demo watches (`user_id = 'phishwatch:demo'`) and the test hook `pw_test_insert_hit`, which works only for the two Clerk dev test users in `test_users` and only for `.invalid` domains.
 
 ## Kill switch
 
