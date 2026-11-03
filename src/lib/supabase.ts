@@ -9,6 +9,7 @@ import { useEffect, useMemo } from "react";
 
 const URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const KEY = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+const TOKEN_CHECK_MS = 10_000;
 
 export function useSupabase(): SupabaseClient | null {
   const { isSignedIn, userId } = useAuth();
@@ -22,6 +23,20 @@ export function useSupabase(): SupabaseClient | null {
     return createClient(URL, KEY, { accessToken: async () => (await getToken()) ?? null });
   }, [isSignedIn, userId]);
 
-  useEffect(() => () => void client?.removeAllChannels(), [client]);
+  // realtime-js only re-reads the token on its 25 s heartbeat, but Clerk can rotate it as
+  // little as ~18 s before the old one expires: then the server closes every channel with
+  // "Token has expired". Offering the current token every 10 s closes that gap. setAuth()
+  // asks the accessToken callback and sends a frame only if the token actually changed.
+  useEffect(() => {
+    if (!client) return;
+    // Development builds only (stripped from production): lets the Playwright recovery test
+    // feed the socket a server frame, the way a real "Token has expired" close arrives.
+    if (process.env.NODE_ENV !== "production") (window as { __phishwatchSupabase?: SupabaseClient }).__phishwatchSupabase = client;
+    const id = setInterval(() => void client.realtime.setAuth(), TOKEN_CHECK_MS);
+    // No removeAllChannels() here: it disconnects the socket asynchronously, after a re-mounted
+    // component may already have queued a join on it. Each channel's owner removes its own, and
+    // realtime-js closes the idle socket by itself 50 s after the last channel leaves.
+    return () => clearInterval(id);
+  }, [client]);
   return client;
 }

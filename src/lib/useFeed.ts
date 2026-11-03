@@ -12,6 +12,8 @@ import { HIT_COLUMNS, RUN_COLUMNS, type Hit, type Run, type ScanStats, type Watc
 
 const FEED_LIMIT = 100;
 export const IDLE_AFTER_MS = 20 * 60 * 1000;
+// 2 s, 4 s, 8 s, 16 s, then every 30 s: quick recovery from a one-off close, no hammering if it repeats
+const rebuildDelay = (attempt: number) => Math.min(30_000, 2_000 * 2 ** attempt);
 
 export type Connection = "connecting" | "live" | "reconnecting" | "paused";
 
@@ -26,6 +28,9 @@ export function useFeed(supabase: SupabaseClient | null, watches: Watch[] | null
   const [runsState, setRunsState] = useState<string>("idle");
   const [visible, setVisible] = useState(true);
   const [idle, setIdle] = useState(false);
+  // bumped to rebuild a channel the server closed (e.g. "Token has expired")
+  const [runsRetry, setRunsRetry] = useState(0);
+  const [hitsRetry, setHitsRetry] = useState(0);
 
   const onNewHitRef = useRef(onNewHit);
   useEffect(() => {
@@ -88,48 +93,51 @@ export function useFeed(supabase: SupabaseClient | null, watches: Watch[] | null
 
   const resume = useCallback(() => setIdle(false), []);
 
-  // ---------------------------------------------------------------- channel helpers
-  // Track a channel's status; after any interruption, refetch to fill the gap.
-  const subscribe = useCallback(
-    (channel: RealtimeChannel, setState: (s: string) => void) => {
-      let interrupted = false;
-      channel.subscribe((status) => {
-        setState(status);
-        if (status === "SUBSCRIBED" && interrupted) void refetch();
-        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") interrupted = true;
-      });
-      return channel;
-    },
-    [refetch],
-  );
+  // Channels reach refetch through a ref, so they don't resubscribe when it changes identity
+  // (e.g. when the brand list finishes loading); they depend only on what they listen to.
+  const refetchRef = useRef(refetch);
+  useEffect(() => {
+    refetchRef.current = refetch;
+  }, [refetch]);
 
   // ---------------------------------------------------------------- runs channel (visible, not idle)
   const runsOpenedBefore = useRef(false);
   useEffect(() => {
     if (!supabase || !visible || idle) return;
-    if (runsOpenedBefore.current) void refetch(); // back from hidden/idle: catch up first
+    if (runsOpenedBefore.current) void refetchRef.current(); // back from hidden/idle/a rebuild: catch up first
     runsOpenedBefore.current = true;
-    const channel = subscribe(
-      supabase.channel("runs").on("postgres_changes", { event: "INSERT", schema: "public", table: "runs" }, ({ new: row }) => {
+    let disposed = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const channel = track(
+      supabase.channel(uniqueName("runs")).on("postgres_changes", { event: "INSERT", schema: "public", table: "runs" }, ({ new: row }) => {
         const run = row as Run;
         setLatestRun(run);
         if (run.ok) setLastOkAt(run.ran_at);
         setStats((s) => (s ? { ...s, scanned_today: s.scanned_today + run.scanned, runs_today: s.runs_today + 1 } : s));
       }),
       setRunsState,
+      () => void refetchRef.current(),
+      () => {
+        if (!disposed) retry = setTimeout(() => setRunsRetry((n) => n + 1), rebuildDelay(runsRetry));
+      },
     );
     return () => {
+      disposed = true;
+      clearTimeout(retry);
       setRunsState("idle");
       void supabase.removeChannel(channel);
     };
-  }, [supabase, visible, idle, subscribe, refetch]);
+  }, [supabase, visible, idle, runsRetry]);
 
   // ---------------------------------------------------------------- hits channel (not idle; stays open when hidden, for notifications)
   useEffect(() => {
     if (!supabase || idle || !watchIds) return;
-    const channel = subscribe(
+    if (hitsRetry > 0) void refetchRef.current(); // rebuilt after the server closed it: catch up
+    let disposed = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const channel = track(
       supabase
-        .channel(`hits:${watchIds}`)
+        .channel(uniqueName("hits"))
         .on(
           "postgres_changes",
           { event: "INSERT", schema: "public", table: "hits", filter: `watch_id=in.(${watchIds})` },
@@ -140,12 +148,18 @@ export function useFeed(supabase: SupabaseClient | null, watches: Watch[] | null
           },
         ),
       setHitsState,
+      () => void refetchRef.current(),
+      () => {
+        if (!disposed) retry = setTimeout(() => setHitsRetry((n) => n + 1), rebuildDelay(hitsRetry));
+      },
     );
     return () => {
+      disposed = true;
+      clearTimeout(retry);
       setHitsState("idle");
       void supabase.removeChannel(channel);
     };
-  }, [supabase, idle, watchIds, subscribe]);
+  }, [supabase, idle, watchIds, hitsRetry]);
 
   // Hits of a removed watch disappear right away (the database cascade-deletes them too).
   const ids = new Set(watchIds.split(","));
@@ -161,4 +175,33 @@ export function useFeed(supabase: SupabaseClient | null, watches: Watch[] | null
         : "connecting";
 
   return { hits: visibleHits, latestRun, lastOkAt, stats, loaded, error, connection, resume };
+}
+
+// realtime-js reuses an existing channel with the same name, and removeChannel() takes a server
+// round trip before the old one leaves the list. Asking for "runs" again in that window (a
+// React re-mount, a rebuild, a visibility change) would hand back the dying channel, and nothing
+// would listen. A postgres_changes channel's name is only a label (the table and filter are
+// in its config), so each subscription gets its own.
+function uniqueName(prefix: string): string {
+  return `${prefix}-${crypto.randomUUID()}`;
+}
+
+// Subscribe and report the channel's status. After an interruption that realtime-js recovers
+// from by itself (it rejoins after errors and timeouts), onRecovered lets the caller refetch.
+// A channel the *server* closed (e.g. "Token has expired") is never rejoined by realtime-js, so
+// onLost asks the caller to rebuild it. The caller ignores onLost for its own cleanup.
+function track(
+  channel: RealtimeChannel,
+  setState: (s: string) => void,
+  onRecovered: () => void,
+  onLost: () => void,
+): RealtimeChannel {
+  let interrupted = false;
+  channel.subscribe((status) => {
+    setState(status);
+    if (status === "SUBSCRIBED" && interrupted) onRecovered();
+    if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") interrupted = true;
+    if (status === "CLOSED") onLost();
+  });
+  return channel;
 }
