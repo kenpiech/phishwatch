@@ -6,6 +6,8 @@ import { config as loadEnv } from "dotenv";
 loadEnv({ path: ".env.local", quiet: true });
 
 const PORT = 3100;
+// PW_BASE_URL=https://phishwatch-umber.vercel.app npx playwright test  -> run against production
+const REMOTE = process.env.PW_BASE_URL;
 
 export default defineConfig({
   testDir: "e2e",
@@ -15,7 +17,7 @@ export default defineConfig({
   workers: 1,
   reporter: [["list"]],
   use: {
-    baseURL: `http://localhost:${PORT}`,
+    baseURL: REMOTE ?? `http://localhost:${PORT}`,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
   },
@@ -23,10 +25,12 @@ export default defineConfig({
     { name: "setup", testMatch: /global\.setup\.ts/ },
     { name: "chromium", use: { ...devices["Desktop Chrome"] }, dependencies: ["setup"] },
   ],
-  webServer: {
-    command: `npx next dev --port ${PORT}`,
-    url: `http://localhost:${PORT}`,
-    reuseExistingServer: true,
-    timeout: 120_000,
-  },
+  webServer: REMOTE
+    ? undefined
+    : {
+        command: `npx next dev --port ${PORT}`,
+        url: `http://localhost:${PORT}`,
+        reuseExistingServer: true,
+        timeout: 120_000,
+      },
 });

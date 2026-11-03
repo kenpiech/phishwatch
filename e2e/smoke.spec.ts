@@ -19,7 +19,7 @@ test("signed in: add a brand, see the scanner live, remove the brand", async ({ 
 
   // leftovers from an interrupted earlier run
   page.on("dialog", (d) => d.accept());
-  const leftovers = page.getByRole("button", { name: /^Stop watching Smoke/ });
+  const leftovers = page.getByRole("button", { name: /^Stop watching (Smoke|Long|Iso|Diag) / });
   await expect(page.getByText(/Your brands/i)).toBeVisible();
   while ((await leftovers.count()) > 0) {
     const n = await leftovers.count();
