@@ -199,3 +199,138 @@ These are the Supabase function logs (`function_logs`) and gateway logs (`functi
 - **Coverage:** we read 1 tile and skip 5–6, so ≈15% of the log in this quieter minute (≈11–12% at busier times).
 - **Where time goes:** downloading from Google (~0.8–1.2 s) dominates, while parsing and scoring stays at 26–46 ms. The CPU budget has room for `tiles_per_run = 3` if we ever want more coverage.
 - **0 hits is normal:** about 1 second of issuance per run, and the demo brands appear a few times a minute *across the whole log*. The first two scheduled minutes produced 2 low-severity hits (Heroku hostnames containing "apple").
+
+## Step 5: Make the page live
+
+**Ask:** "Trace one update for me, from the source to my screen, and name every part it passes through."
+
+*Answer written by the agent overnight (2026-11-03), from the production database, to read before the live quiz.*
+
+A real update: match **#892** for the Microsoft demo brand, `www.www.login.microsoftonline-billing-verification-secured-help.109-206-162-145.plesk[.]page`, **likely**, score 10. Times are UTC, 2026-11-03.
+
+| # | Part | What happens | Evidence |
+|---|---|---|---|
+| 1 | **Let's Encrypt** (a CA) | Someone who controls that name asks for a certificate. Before issuing it, the CA must publish it in CT logs, because browsers reject unlogged certificates. | `issuer = Let's Encrypt`, `entry_type = 0` (a final certificate) |
+| 2 | **Google's CT log** ParcelYard 2027h1 | Appends it as entry **582,780,574** at **03:01:28.467**. That entry sits in tile ⌊582,780,574 / 256⌋ = **2276486**, which becomes a full, immutable 256-entry file once its last entry lands. | `log_index`, `entry_ts` |
+| 3 | **Supabase Cron** (`pg_cron`, job `scan-every-10s`) | At ~03:01:29.9 runs its SQL: `net.http_post` (`pg_net`) to `/functions/v1/scan`, with the project URL and the secret key read from **Vault** at call time. | `cron.job` |
+| 4 | **Edge Functions gateway → `withSupabase({ auth: "secret" })`** | Checks the `apikey` header against the project's secret keys (a stranger gets 401), then hands the handler an admin client. | `index.ts` |
+| 5 | **`claim_scan()`** (Postgres RPC) | Checks the kill switch, backoff and lease, and takes a 60 s lease so runs can't overlap. Returns the cursor. | `worker_rpcs` migration |
+| 6 | **Google again** (2 HTTP GETs) | `/checkpoint` reports a tree size of **582,780,815**, so the newest full tile is **2276486**. **7** newer-than-cursor tiles are skipped (sampling). `GET /tile/data/x002/x276/486` downloads 256 entries. Both took **1,228 ms**. | run 3527: `tree_size`, `tile_from`, `skipped`, `fetch_ms` |
+| 7 | **`tile.ts` → `x509.ts` → `score.ts`** (inside the function) | Splits the tile into 256 entries, reads each certificate's SAN names (**296** unique domains after cleanup), and scores each against every brand. This one: `microsoftonline` is "microsoft" glued to "online", the brand is in a subdomain of someone else's domain (`….plesk.page`), it has bait words *billing* and *login*, and 7 hyphens, giving 2+3+4+1 = **10, likely**. All of this took **18 ms** of CPU. | run 3527: `domains`, `parse_ms`; hit `reasons` |
+| 8 | **`finish_scan()`** (one Postgres transaction) | Upserts the hit (new `(watch, domain)` → **insert**), writes `runs` row **3527** (`hits_inserted = 1`), moves the cursor to 2276487 and releases the lease. Commits at **03:01:31.190**: **2.7 s** after Google logged the certificate. | hit `created_at` = run `ran_at` (same transaction) |
+| 9 | **Postgres WAL → Realtime** | The committed insert is in the write-ahead log. `hits` is in the `supabase_realtime` publication, so Supabase Realtime reads the change from its replication slot. | `alter publication supabase_realtime add table hits, runs` |
+| 10 | **Realtime's authorization, per subscriber** | Open pages subscribed to `hits` with a filter `watch_id=in.(their watch ids)` are candidates. For each one, Realtime runs the `hits` select policy **as that subscriber**, using the Clerk token their socket last presented: "is this hit's watch yours?". That needs all three things the spec lists: the table in the publication, `grant select` to `authenticated`, and the policy. | `schema` migration |
+| 11 | **The WebSocket → supabase-js** | Only the owner's socket receives a `postgres_changes` frame with the new row as JSON. | frame logs during Step 5 testing |
+| 12 | **`useFeed` → React** | The channel callback prepends the row to the feed state and calls `onNewHit`, which highlights it for 10 s, raises a toast ("New likely-phishing domain for Microsoft"), adds `(1)` to the tab title if the tab is hidden, and sends a system notification if you opted in. | `useFeed.ts`, `useNotifications.ts` |
+| 13 | **`Feed` → the screen** | Renders the row: red "Likely phishing" badge, the domain **defanged** (`…plesk[.]page`, plain text, never a link), the reasons in words ("brand inside “microsoftonline”", "brand as a subdomain", "bait word: billing" …), Let's Encrypt, "certificate", "N s ago", and urlscan/VirusTotal lookups. | `Feed.tsx` |
+
+In parallel, `runs` row 3527 takes the same path from step 9 on, on the `runs` channel (every signed-in user may read runs). The status bar sets "Live · scanned 256 certificates · 0 s ago" and adds 256 to today's total.
+
+**An honest footnote:** #892 belongs to a hidden demo brand owned by a placeholder user nobody can sign in as, so at step 10 Realtime found **no** authorized subscriber and no screen received it. That's RLS working as intended. Steps 10–13 for a real person are what the Playwright two-user test proves: a match created for A's brand appears on A's open page without a reload, with a toast, and never on B's.
+
+**Keeping the socket authorized:** Clerk tokens live about 60 s. supabase-js asks our `accessToken` callback (Clerk's `getToken()`) for the current token on each 25 s heartbeat, and the page also asks every 10 s (see below). When the token has changed, it sends an `access_token` frame on every channel, and the server re-checks and replies "Subscribed to PostgreSQL".
+
+### What testing found: three Realtime bugs, fixed overnight
+
+The two-user test passed on its first real run. A test that keeps the page open for minutes did not: after about 2.5 minutes, live updates stopped and the page sat on "Reconnecting…". Recording every WebSocket frame (Playwright `page.on("websocket")`) traced it to three separate bugs.
+
+1. **Token rotation race.** realtime-js re-reads the token only on its 25 s heartbeat, but Clerk sometimes mints the next 60 s token only ~18 s before the old one expires. The recording showed a token pushed at 103.5 s expiring at 151.6 s, with Clerk's replacement arriving at ~134 s: between heartbeats. At 151.6 s the server sent `"Token has expired 0 seconds ago"` and closed both channels (`phx_close`).
+   **Fix:** the page offers Clerk's current token every 10 s (`realtime.setAuth()`); a frame goes out only when the token actually changed.
+2. **Closed channels are never rejoined.** realtime-js rejoins after errors and timeouts, but not after the *server* closes a channel. The page waited forever.
+   **Fix:** on a close we didn't cause, rebuild the channel after 2 s (backing off to 30 s if it keeps happening) and refetch what was missed.
+3. **A new channel could be the dying old one.** realtime-js reuses an existing channel with the same name, and removing one takes a server round trip. Asking for `"runs"` again in that window (a React re-mount, the rebuild in fix 2) handed back the channel that was shutting down. Separately, our sign-out cleanup (`removeAllChannels()`) disconnected the socket *after* a re-mounted component had queued its join. Together these broke Realtime completely for a user with **zero brands**, which is every new user. With brands, a later subscription happened to reconnect the socket and hid the bug.
+   **Fix:** every subscription gets a unique channel name (`runs-<uuid>`), and each channel's owner removes its own.
+
+**Proof:**
+- the 3.5-minute test (at least three token rotations) now passes
+- a new recovery test feeds the page's socket the exact two frames from the recorded failure and checks that the page rejoins and is live again within ~10 s
+- with the rebuild code disabled, that test fails, so it really tests the fix
+
+## Step 6: Deploy & test
+
+### Ask 1: "Quiz me on how my system works, one question at a time, and tell me what I got wrong. Start with the questions in Be Ready to Explain."
+
+*The live quiz needs you, so this is the study guide the agent quizzes from: the four "Be Ready to Explain" questions, then follow-ups, each with a model answer from the real system. Cover the answers and try each question first.*
+
+**1. Tracing a data change: when the data source changes, what happens in the worker, in the database, and on someone's screen?**
+> The source changing means a CA publishing a certificate into Google's CT log, which grows by roughly 200 entries a second. Within 10 s, Supabase Cron POSTs to the `scan` Edge Function with the secret key from Vault. The worker reads `/checkpoint` (tree size), computes the newest full tile, downloads it (256 entries), reads each certificate's SAN domains, and scores each domain against every brand. In the **database**, `finish_scan` upserts only what changed in one transaction: new `(watch, domain)` pairs are inserted, a newer sighting updates `last_seen_at`/`seen_count`, a repeat does nothing. It also adds one `runs` row and moves the cursor. Postgres sends the inserts to **Realtime**, which checks RLS for each subscriber and pushes the hit only to its owner's open page, where it slides in highlighted, with a toast. Real example: match #892 was logged at 03:01:28.467 and saved at 03:01:31.190, 2.7 s later (see Step 5).
+
+**2. The data flow: how data moves from the source to the page, and what would break if one part changed.**
+> CT log → (HTTP GET) → Edge Function → (RPC upsert) → Postgres → (WAL) → Realtime → (WebSocket) → page. The page also reads Postgres directly for the initial load, with the Clerk JWT. What breaks:
+> - a log shard rename → 404 → `runs.ok = false` → page **down** (fix `scan_state.log_url`)
+> - a tile format change → the parser throws → **down** with the error
+> - the cron stops → no runs → **stale** after 30 s
+> - the table removed from the publication, or the grant or policy dropped → the page silently gets nothing → **stale** (for runs) or an empty feed
+> - a Clerk/Supabase auth change → RLS denies → empty page, caught by the two-user test
+>
+> The chart is in the README.
+
+**3. Freshness: how someone knows the data is current.**
+> The status bar, recomputed every second from the latest `runs` row, never from hits (zero hits is normal):
+> - **Live** · "scanned 256 certificates · 4 s ago" while the last run is ok and ≤ 30 s old
+> - **No update for 2 min** (stale) when > 30 s (three missed runs)
+> - **Scanner error: …** (down) when the latest run failed, with the last success time
+> - **Paused** when the kill switch is on
+> - a **Reconnecting…** chip, kept separate from freshness, when the WebSocket drops
+>
+> Today's total ("2.1 M certificates checked today") comes from `scan_stats()`.
+
+**4. Agentic workflow: what your agent's tests check, and what you found in the logs.**
+> - **Worker** (`deno test`, 51 tests):
+>   - the real saved tile parses to exactly 256 entries, with every byte consumed
+>   - its 172 certificates' SAN names match openssl's
+>   - certificates generated with openssl yield exactly 7 expected hits and scores
+>   - the end-to-end run saves exactly the expected rows
+>   - a rerun saves 0, a newer sighting updates 1
+>   - failures keep the cursor; 429 backs off; the kill switch makes no requests
+>
+>   Tests were also checked by breaking the code on purpose (they fail).
+> - **Page** (`npm test`): status rules, defanging, validation.
+> - **Playwright:**
+>   - the signed-out page
+>   - add/remove a brand
+>   - A vs B isolation in the page and through the API
+>   - a live match without a reload
+>   - B can't plant a match on A's brand
+>   - a 3.5-minute session across token rotations
+  - recovery after the server closes a channel
+> - **Logs:**
+>   - four phases per run (checkpoint → tiles → score → write)
+>   - downloading dominates (≈1 s); scoring takes 20–50 ms
+>   - the cursor chain never re-reads a tile
+>   - one checkpoint timeout in 3,500 runs, which led to clearer timeout errors
+>   - live hits exposed scorer noise (`bsicloud`, `ccloud`/`hcloud`, Heroku hostnames), fixed with tests
+>   - WebSocket frame recordings caught three Realtime bugs (token rotation race, closed channels never rejoined, dying channels reused), all fixed with tests
+
+**Follow-ups worth rehearsing**
+- *Why upsert and not a plain insert?* So reruns can't duplicate rows or Realtime alerts. The unique key plus `on conflict … do update … where newer` makes every run idempotent.
+- *Why does the worker use the secret key, and where is it?* The worker isn't a user, and it must write `hits`/`runs`, which clients can't. The key is in the function's environment (provided by Supabase) and in Vault for cron; never in git or on Vercel.
+- *Why INSERT-only subscriptions?* Pruning deletes rows, and Realtime can't apply RLS to DELETE events; we don't need updates on screen.
+- *Why sample 1 tile in ~9?* One free Edge Function call every 10 s fits the quotas; reading everything needs an always-on streaming worker.
+- *How is a classmate kept out of your data?* Every table has RLS keyed on the Clerk `sub`; the hits policy joins to the owner's watches; the two-user test proves it in the browser and through the API.
+- *Why are domains defanged?* They may be live phishing sites; `[.]` stops autolinking, and we only link to urlscan/VirusTotal lookups.
+
+### Ask 2: "Walk me through the free tier limits for each service my app uses, and how to set usage limits and spending alerts for each one."
+
+*Limits checked on the providers' pricing pages on 2026-11-03; usage measured from the database the same night (the first 10 hours: 3,536 runs, 2 failures, 19 MB database).*
+
+**The ground rule:** no service has a payment method on file, so nothing can be charged. At a limit, the worst case is a paused or restricted service. If any service ever asks for a card, stop and ask first.
+
+| Service | Free limit | phishwatch's use | At the limit |
+|---|---|---|---|
+| **Supabase** (Free) | 500 k Edge Function calls/month | cron every 10 s ≈ 8,640/day ≈ **268 k (54%)** | Supabase emails the owner and may restrict the project until the cycle resets. No overage billing on Free; spend caps are a Pro feature. |
+| | 2 M Realtime messages/month · 200 concurrent connections | 1 `runs` message per run **per open tab** (360 per tab-hour); hits are rare. The runs channel closes in hidden tabs; both close after 20 idle minutes. | |
+| | 500 MB database · 5 GB egress | 19 MB after 10 h; `prune-daily` keeps runs to 2 days and cron history to 1 day; small JSON payloads | |
+| | pauses after 1 week without use · 2 active projects | the cron counts as activity, but open the app now and then until grades are back | |
+| **Vercel** (Hobby) | 1 M function invocations, 100 GB Fast Data Transfer, 4 h active CPU per month | the page is a static shell; data goes browser → Supabase directly, so Vercel serves almost nothing | the feature pauses until 30 days have passed. Hobby has no spend management, because nothing can be billed. Non-commercial use only. |
+| **Clerk** (Hobby/Free) | 50,000 monthly retained users per app; email codes included; no card | a class's worth of users | a one-month grace period to upgrade. phishwatch runs on a **development instance** (the console warns of stricter usage limits), fine for a demo; real use would need a production instance on a custom domain. |
+| **Google CT log** | no account, no published quota | 1 checkpoint + 1 tile (~370 KB) per run ≈ 3 GB/day; `User-Agent` names the repo; immutable tiles cache well | backoff on 429/5xx (5 min) |
+
+**Where to watch usage and set alerts:**
+- **Supabase:** Dashboard → Organization → **Usage** shows each quota above as a bar for the billing cycle. Free plans get email notices as limits approach. phishwatch's own safeguards:
+  - **Kill switch:** `update scan_state set enabled = false;`
+  - **Full stop:** `select cron.unschedule('scan-every-10s');`
+  - **Health query:** in the README
+- **Vercel:** Dashboard → team **Usage**: per-resource meters for the month. Spend Management (alerts and hard limits) is Pro-only; on Hobby the limit itself is the cap.
+- **Clerk:** Dashboard → the app → **Billing/Usage** shows retained users. No card means no overage.
+- **Google:** nothing to configure. Be polite, and the worker backs off by itself.
